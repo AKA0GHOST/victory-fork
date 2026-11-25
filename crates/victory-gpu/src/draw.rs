@@ -1421,6 +1421,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        let walked = started.elapsed();
+        let walked_slots = slots.len();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1464,7 +1466,26 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let refreshed = started.elapsed();
         self.heap_textures(list, heap, host);
+        // Diagnostic: the pass in parts (first 8 passes, then every 32nd).
+        {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n % 32 == 0 {
+                let all = started.elapsed();
+                tracing::info!(
+                    n,
+                    slots = walked_slots,
+                    views,
+                    copies = spans.len(),
+                    walk_ms = walked.as_secs_f64() * 1e3,
+                    refresh_ms = (refreshed - walked).as_secs_f64() * 1e3,
+                    textures_ms = (all - refreshed).as_secs_f64() * 1e3,
+                    "heap buffer pass in parts"
+                );
+            }
+        }
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
