@@ -2061,6 +2061,31 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// Diagnostic: logs a read that stalls behind flights' writes, with the
+/// written range it hit (first 16 and then powers of two).
+fn note_blocked_read(kind: &str, written: &[(usize, usize)], from: usize, to: usize) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() {
+        return;
+    }
+    let at = written.partition_point(|r| r.1 <= from);
+    let Some(&(a, b)) = written.get(at) else { return };
+    let total: usize = written.iter().map(|r| r.1 - r.0).sum();
+    tracing::warn!(
+        n,
+        kind,
+        read = format_args!("{from:#x}..{to:#x}"),
+        read_len = to - from,
+        hit = format_args!("{a:#x}..{b:#x}"),
+        hit_len = b - a,
+        overlap = b.min(to) - a.max(from),
+        written_ranges = written.len(),
+        written_total = total,
+        "a read stalls behind flights' writes"
+    );
+}
+
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
@@ -2115,6 +2140,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            let (f, t) = if touches(written, src, src + len) { (src, src + len) } else { (dst, dst + len) };
+                            note_blocked_read("copy", written, f, t);
                         }
                         return Some(WHY_READ);
                     }
@@ -2123,6 +2150,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            note_blocked_read("fill", written, src, src + len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2132,6 +2160,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            note_blocked_read("texture", written, at, at + len);
                         }
                         return Some(WHY_READ);
                     }

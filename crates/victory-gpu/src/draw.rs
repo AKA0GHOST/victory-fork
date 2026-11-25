@@ -1162,7 +1162,7 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                s.gpu_writes(list, a, len);
+                s.gpu_writes(list, a, len, "root uav");
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -2756,7 +2756,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes(list, address, len, "uav view");
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

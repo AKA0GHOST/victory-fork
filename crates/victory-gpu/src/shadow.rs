@@ -1752,7 +1752,15 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, source: &str) {
+        // Diagnostic: who declares big write ranges (first 16, then powers of two).
+        if len >= 16 << 20 {
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 16 || n.is_power_of_two() {
+                tracing::warn!(n, source, at = format_args!("{address:#x}"), len, "a big range declared as written by shaders");
+            }
+        }
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
