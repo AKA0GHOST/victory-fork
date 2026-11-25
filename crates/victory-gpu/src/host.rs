@@ -40,6 +40,9 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    /// Set by the relay thread once a submission's deferred fills are
+    /// done ([`Late::Fill`]); the queue waits for it ahead of that submission.
+    fill_fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -639,6 +642,7 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let fill_fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -662,6 +666,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
+            fill_fence,
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -1982,6 +1987,38 @@ enum Late {
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
     Signal(usize, u64),
+    /// Fills of upload memory (destination, source, bytes) a submission
+    /// left until the flights before it have landed, then the value set on
+    /// [`Host::fill_fence`], which the card waits for ahead of it
+    /// ([`late_fills`]).
+    Fill(Vec<(usize, usize, usize)>, u64),
+}
+
+/// With [`relay`]: a fill of upload memory that reads what flights in the
+/// air may write does not stop the preparing thread. It is done by the
+/// thread that lands flights once they have landed, and the card waits for
+/// it on its own queue (`VICTORY_LATE_FILLS=0` waits on the CPU as before).
+/// Off with copies in the card's memory: their fetch goes on the same
+/// queue, behind the submission that waits.
+fn late_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        relay() && !crate::shadow::cards() && std::env::var_os("VICTORY_LATE_FILLS").is_none_or(|v| v != "0")
+    })
+}
+
+/// Deferred fills done so far, and submissions that deferred any.
+static LATE_FILLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Does deferred fills ([`Late::Fill`]) and lets the card go on.
+fn do_fills(host: &Host, fills: &[(usize, usize, usize)], value: u64) {
+    for &(dst, src, len) in fills {
+        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+    }
+    // SAFETY: our fence; set from the CPU.
+    if let Err(e) = unsafe { host.fill_fence.Signal(value) } {
+        fail(format_args!("deferred fills could not be signalled ({e})"));
+    }
 }
 
 struct Line {
@@ -2130,6 +2167,12 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    blocked_by_any(written, runs, count, true)
+}
+
+/// [`blocked_by`]; with `fills` false, fills of upload memory do not block
+/// (they can be left to [`Late::Fill`]).
+fn blocked_by_any(written: &[(usize, usize)], runs: &[&HostList], count: bool, fills: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -2147,7 +2190,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if fills && touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             note_blocked_read("fill", written, src, src + len);
@@ -2581,6 +2624,10 @@ fn late_line(frames: f64) {
             w[WHY_WRITES],
             w[WHY_FENCE],
         );
+    }
+    if late_fills() {
+        let f: Vec<f64> = LATE_FILLED.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!("fills left to the landing thread per frame: {:.1} in {:.1} submissions (VICTORY_LATE_FILLS)", f[0], f[1]);
     }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -3537,6 +3584,7 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Fill(fills, value) => do_fills(self, &fills, value),
             }
         }
         if last > 0 {
@@ -3937,6 +3985,7 @@ impl Host {
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Fill(fills, value) => do_fills(self, &fills, value),
                 }
             }
             if last > 0 {
@@ -3975,10 +4024,33 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // Fills that read what flights may write, left to the landing thread.
+        let mut late_written: Option<Vec<(usize, usize)>> = None;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
+            let written = if why == WHY_READ && late_fills() {
+                let line = line();
+                let other = blocked_by_any(&line.written, runs, false, false);
+                if let Some(other) = other {
+                    // Diagnostic: what else stops fills from being left (first 16, then powers of two).
+                    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 16 || n.is_power_of_two() {
+                        let what = match other {
+                            WHY_RUN => "a step of ours",
+                            _ => "a buffer copy or texture",
+                        };
+                        tracing::warn!(n, what, "fills not left to the landing thread: something else reads what flights write");
+                    }
+                }
+                other.is_none().then(|| line.written.clone())
+            } else {
+                None
+            };
+            if written.is_some() {
+                late_written = written;
+            } else if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
@@ -4018,6 +4090,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        batch.late = late_written.map(|w| (w, Vec::new()));
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -4090,6 +4163,24 @@ impl Host {
         }
         let prepared = std::time::Instant::now();
         if late {
+            // Fills left to the landing thread: queued behind the flights in
+            // the air, and the card waits for them ahead of these lists.
+            if let Some((_, fills)) = batch.late.take()
+                && !fills.is_empty()
+            {
+                static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let value = SENT.fetch_add(1, Ordering::Relaxed) + 1;
+                LATE_FILLED[0].fetch_add(fills.len() as u64, Ordering::Relaxed);
+                if LATE_FILLED[1].fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!("fills behind flights are left to the landing thread; the card waits for them (VICTORY_LATE_FILLS)");
+                }
+                line().line.push(Late::Fill(fills, value));
+                RELAY_MOVED.notify_one();
+                // SAFETY: our fence, set by the landing thread.
+                if let Err(e) = unsafe { self.queue.Wait(&self.fill_fence, value) } {
+                    fail(format_args!("the card could not wait for deferred fills ({e})"));
+                }
+            }
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -5206,7 +5297,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    match &mut batch.late {
+                        Some((written, fills)) if touches(written, src, src + len) => fills.push((dst, src, len)),
+                        _ => copy_mapped(dst as *mut u8, src as *const u8, len, false),
+                    }
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -5300,6 +5394,9 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`late_fills`]: what flights in the air may write, and the
+    /// fills that read it, left for [`Late::Fill`].
+    late: Option<(Vec<(usize, usize)>, Vec<(usize, usize, usize)>)>,
 }
 
 impl Batch {
