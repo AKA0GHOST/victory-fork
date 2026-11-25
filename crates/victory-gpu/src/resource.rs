@@ -1444,8 +1444,19 @@ pub(crate) fn let_go_idle() {
     const LONG_MS: u64 = 30_000;
     static LRU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let lru = *LRU.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_none_or(|v| v != "0"));
+    // Evicted down to a share below the one new copies may fill
+    // (`VICTORY_TEXTURE_KEEP_PERCENT`, default 5 points under the room):
+    // kept at the room's own share, the card went over its budget as other
+    // allocations grew, and the system moved its memory into the PC's (hyp4).
+    static KEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let keep = *KEEP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_KEEP_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(room_percent().saturating_sub(5), |p| p.clamp(40, room_percent()))
+    });
     let mut over = match memory {
-        Some([budget, used, ..]) if lru => used.saturating_sub(budget / 100 * room_percent()),
+        Some([budget, used, ..]) if lru => used.saturating_sub(budget / 100 * keep),
         _ => u64::MAX,
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
