@@ -362,6 +362,10 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic: microseconds the texture pass spent in fingerprints and
+/// mapped-page queries, in making host textures ready (`readable`), and
+/// textures it made ready.
+static TEXTURE_PASS_PARTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
@@ -1482,6 +1486,9 @@ impl State {
                     walk_ms = walked.as_secs_f64() * 1e3,
                     refresh_ms = (refreshed - walked).as_secs_f64() * 1e3,
                     textures_ms = (all - refreshed).as_secs_f64() * 1e3,
+                    since_last_checks_ms = TEXTURE_PASS_PARTS[0].swap(0, Ordering::Relaxed) as f64 / 1e3,
+                    since_last_making_ms = TEXTURE_PASS_PARTS[1].swap(0, Ordering::Relaxed) as f64 / 1e3,
+                    since_last_made = TEXTURE_PASS_PARTS[2].swap(0, Ordering::Relaxed),
                     "heap buffer pass in parts"
                 );
             }
@@ -1698,8 +1705,11 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            let checking = std::time::Instant::now();
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let same = crate::texture::fingerprint(at, len) == print;
+                TEXTURE_PASS_PARTS[0].fetch_add(checking.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if same {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -1726,7 +1736,9 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                let querying = std::time::Instant::now();
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                TEXTURE_PASS_PARTS[0].fetch_add(querying.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1766,6 +1778,7 @@ impl State {
                 }
                 continue;
             }
+            let making = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -1788,6 +1801,8 @@ impl State {
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
+            TEXTURE_PASS_PARTS[1].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+            TEXTURE_PASS_PARTS[2].fetch_add(1, Ordering::Relaxed);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)

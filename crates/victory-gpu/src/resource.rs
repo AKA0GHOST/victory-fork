@@ -1433,22 +1433,53 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    let idle_ms = crate::host::vram_idle_ms(memory);
+    // Least recently used, by need (`VICTORY_TEXTURE_LRU=0`: every idle
+    // copy goes, as before). Under VRAM pressure every copy idle for a second
+    // went, so a texture off screen for a moment at 2-3 fps was uploaded
+    // again when it came back (8.7 GB let go, 3.3 GB made again, run hyp2).
+    // Now the idle copies go oldest first, only as many bytes as bring the
+    // card back under the textures' share, and any copy idle for `LONG_MS`.
+    const LONG_MS: u64 = 30_000;
+    static LRU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lru = *LRU.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_none_or(|v| v != "0"));
+    let mut over = match memory {
+        Some([budget, used, ..]) if lru => used.saturating_sub(budget / 100 * room_percent()),
+        _ => u64::MAX,
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
+    // Oldest use first.
+    let mut order: Vec<(u64, usize)> = all
+        .iter()
+        .map(|&at| {
+            // SAFETY: as below.
+            let r = unsafe { &*(at as *const Resource) };
+            (r.host.used.load(Relaxed), at)
+        })
+        .collect();
+    if lru {
+        order.sort_unstable_by_key(|&(used, _)| used);
+    }
+    for &(_, at) in order.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
         }
+        let used = r.host.used.load(Relaxed);
+        let long = crate::host::long_ago(used, LONG_MS, IDLE_FRAMES);
+        if over == 0 && !long {
+            continue;
+        }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1467,6 +1498,7 @@ pub(crate) fn let_go_idle() {
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
             bytes += host.bytes;
+            over = over.saturating_sub(host.bytes);
             if first.is_none() {
                 first = Some(at);
             }
